@@ -65,11 +65,25 @@ impl Compactor {
 
         // The sequence from the original message that needs to be compacted
         // Filter out droppable messages (e.g., attachments) from compaction
-        let compaction_sequence = context.messages[start..=end]
-            .iter()
-            .filter(|msg| !msg.is_droppable())
-            .cloned()
-            .collect::<Vec<_>>();
+        let compaction_sequence = context
+            .messages
+            .get(start..=end)
+            .map(|slice| {
+                slice
+                    .iter()
+                    .filter(|msg| !msg.is_droppable())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    "Compaction range [{}..={}] out of bounds for {} messages",
+                    start,
+                    end,
+                    context.messages.len()
+                );
+                Vec::new()
+            });
 
         // Create a temporary context for the sequence to generate summary
         let sequence_context = Context::default().messages(compaction_sequence.clone());
@@ -121,11 +135,13 @@ impl Compactor {
 
         // Accumulate usage from all messages in the compaction range before they are
         // destroyed
-        let compacted_usage = context.messages[start..=end]
-            .iter()
-            .filter_map(|entry| entry.usage.as_ref())
-            .cloned()
-            .reduce(|a, b| a.accumulate(&b));
+        let compacted_usage = context.messages.get(start..=end).and_then(|slice| {
+            slice
+                .iter()
+                .filter_map(|entry| entry.usage.as_ref())
+                .cloned()
+                .reduce(|a, b| a.accumulate(&b))
+        });
 
         // Replace the range with the summary, transferring the accumulated usage
         let mut summary_entry = MessageEntry::from(ContextMessage::user(summary, None));
@@ -646,5 +662,120 @@ mod tests {
             Some(expected_total_usage),
             "accumulate_usage() must include usage from both compacted and surviving messages"
         );
+    }
+
+    /// Creates a Context from a condensed string pattern where:
+    /// - 'u' = User message
+    /// - 'a' = Assistant message
+    /// - 's' = System message
+    fn ctx(pattern: &str) -> Context {
+        forge_domain::MessagePattern::new(pattern).build()
+    }
+
+    #[test]
+    fn test_should_compact_no_thresholds_set() {
+        let fixture = Compact::new().model("test-model");
+        let context = ctx("ua");
+        let actual = fixture.should_compact(&context, 1000);
+        assert_eq!(actual, false);
+    }
+
+    #[test]
+    fn test_should_compact_token_threshold_triggers() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .token_threshold(100_usize);
+        let context = ctx("u");
+        let actual = fixture.should_compact(&context, 150);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_should_compact_turn_threshold_triggers() {
+        let fixture = Compact::new().model("test-model").turn_threshold(1_usize);
+        let context = ctx("uau");
+        let actual = fixture.should_compact(&context, 50);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_should_compact_message_threshold_triggers() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .message_threshold(2_usize);
+        let context = ctx("uau");
+        let actual = fixture.should_compact(&context, 50);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_should_compact_multiple_thresholds_any_triggers() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .token_threshold(200_usize)
+            .turn_threshold(5_usize)
+            .message_threshold(10_usize);
+        let context = ctx("ua");
+        let actual = fixture.should_compact(&context, 250);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_should_compact_multiple_thresholds_none_trigger() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .token_threshold(200_usize)
+            .turn_threshold(5_usize)
+            .message_threshold(10_usize);
+        let context = ctx("ua");
+        let actual = fixture.should_compact(&context, 100);
+        assert_eq!(actual, false);
+    }
+
+    #[test]
+    fn test_should_compact_empty_context() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .message_threshold(1_usize);
+        let context = ctx("");
+        let actual = fixture.should_compact(&context, 0);
+        assert_eq!(actual, false);
+    }
+
+    #[test]
+    fn test_should_compact_last_user_message_integration() {
+        let fixture = Compact::new().model("test-model").on_turn_end(true);
+        let context = ctx("au");
+        let actual = fixture.should_compact(&context, 10);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_should_compact_last_user_message_integration_disabled() {
+        let fixture = Compact::new().model("test-model").on_turn_end(false);
+        let context = ctx("au");
+        let actual = fixture.should_compact(&context, 10);
+        assert_eq!(actual, false);
+    }
+
+    #[test]
+    fn test_should_compact_multiple_conditions_with_last_user_message() {
+        let fixture = Compact::new()
+            .model("test-model")
+            .token_threshold(200_usize)
+            .on_turn_end(true);
+        let context = ctx("au");
+        let actual = fixture.should_compact(&context, 50);
+        assert_eq!(actual, true);
+    }
+
+    #[test]
+    fn test_compact_model_none_falls_back_to_agent_model() {
+        let compact = Compact::new()
+            .token_threshold(1000_usize)
+            .turn_threshold(5_usize);
+        assert_eq!(compact.model, None);
+        assert_eq!(compact.token_threshold, Some(1000_usize));
+        assert_eq!(compact.turn_threshold, Some(5_usize));
     }
 }

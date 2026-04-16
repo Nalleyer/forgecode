@@ -2,11 +2,19 @@ use std::collections::HashMap;
 
 use anyhow::Context as _;
 use async_openai::types::responses as oai;
-use forge_app::domain::{Context as ChatContext, ContextMessage, Role, ToolChoice};
+use forge_app::domain::{Context as ChatContext, ContextMessage, MessagePhase, Role, ToolChoice};
 use forge_app::utils::enforce_strict_schema;
 use forge_domain::{Effort, ReasoningConfig, ReasoningFull};
 
 use crate::provider::FromDomain;
+
+/// Converts domain MessagePhase to OpenAI MessagePhase
+fn to_oai_phase(phase: MessagePhase) -> oai::MessagePhase {
+    match phase {
+        MessagePhase::Commentary => oai::MessagePhase::Commentary,
+        MessagePhase::FinalAnswer => oai::MessagePhase::FinalAnswer,
+    }
+}
 
 /// Groups reasoning details by their ID and builds OpenAI `ReasoningItem`
 /// input items.
@@ -105,9 +113,13 @@ impl FromDomain<ReasoningConfig> for oai::Reasoning {
         // Map effort level
         if let Some(effort) = config.effort {
             let oai_effort = match effort {
-                Effort::High => oai::ReasoningEffort::High,
-                Effort::Medium => oai::ReasoningEffort::Medium,
+                Effort::None => oai::ReasoningEffort::None,
+                Effort::Minimal => oai::ReasoningEffort::Minimal,
                 Effort::Low => oai::ReasoningEffort::Low,
+                Effort::Medium => oai::ReasoningEffort::Medium,
+                Effort::High => oai::ReasoningEffort::High,
+                // XHigh and Max both map to the highest available OAI level.
+                Effort::XHigh | Effort::Max => oai::ReasoningEffort::Xhigh,
             };
             builder.effort(oai_effort);
         } else if config.enabled.unwrap_or(false) {
@@ -185,6 +197,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                                 r#type: oai::MessageType::Message,
                                 role: oai::Role::Developer,
                                 content: oai::EasyInputContent::Text(message.content),
+                                phase: None,
                             }));
                         }
                     }
@@ -193,6 +206,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                             r#type: oai::MessageType::Message,
                             role: oai::Role::User,
                             content: oai::EasyInputContent::Text(message.content),
+                            phase: None,
                         }));
                     }
                     Role::Assistant => {
@@ -201,6 +215,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                                 r#type: oai::MessageType::Message,
                                 role: oai::Role::Assistant,
                                 content: oai::EasyInputContent::Text(message.content),
+                                phase: message.phase.map(to_oai_phase),
                             }));
                         }
 
@@ -224,6 +239,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                                         arguments: call.arguments.into_string(),
                                         call_id,
                                         name: call.name.to_string(),
+                                        namespace: None,
                                         id: None,
                                         status: None,
                                     },
@@ -268,6 +284,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                                 image_url: Some(img.url().clone()),
                             }),
                         ]),
+                        phase: None,
                     }));
                 }
             }
@@ -289,6 +306,7 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
                             parameters: Some(codex_tool_parameters(&tool.input_schema)?),
                             strict: Some(true),
                             description: Some(tool.description),
+                            defer_loading: None,
                         }))
                     })
                     .collect::<anyhow::Result<Vec<oai::Tool>>>()
@@ -341,6 +359,15 @@ impl FromDomain<ChatContext> for oai::CreateResponse {
 
         response.stream = Some(true);
 
+        // When reasoning is configured, request encrypted content so it can be
+        // replayed in subsequent turns for stateless reasoning continuity.
+        if response.reasoning.is_some() {
+            let includes = response.include.get_or_insert_with(Vec::new);
+            if !includes.contains(&oai::IncludeEnum::ReasoningEncryptedContent) {
+                includes.push(oai::IncludeEnum::ReasoningEncryptedContent);
+            }
+        }
+
         Ok(response)
     }
 }
@@ -352,8 +379,11 @@ mod tests {
         Context as ChatContext, ContextMessage, ModelId, ToolCallId, ToolChoice,
     };
     use forge_app::utils::enforce_strict_schema;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
 
     use crate::provider::FromDomain;
+    use crate::provider::openai_responses::request::codex_tool_parameters;
 
     #[test]
     fn test_reasoning_config_conversion_with_effort() -> anyhow::Result<()> {
@@ -441,6 +471,40 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_request_with_reasoning_includes_encrypted_content() -> anyhow::Result<()> {
+        use forge_domain::{Effort, ReasoningConfig};
+
+        let reasoning = ReasoningConfig {
+            effort: Some(Effort::High),
+            max_tokens: None,
+            exclude: None,
+            enabled: Some(true),
+        };
+
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("Test", None))
+            .reasoning(reasoning);
+
+        let actual = oai::CreateResponse::from_domain(context)?;
+
+        let expected = Some(vec![oai::IncludeEnum::ReasoningEncryptedContent]);
+        assert_eq!(actual.include, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codex_request_without_reasoning_has_no_include() -> anyhow::Result<()> {
+        let context = ChatContext::default().add_message(ContextMessage::user("Test", None));
+
+        let actual = oai::CreateResponse::from_domain(context)?;
+
+        assert_eq!(actual.include, None);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_codex_request_from_context_converts_messages_tools_and_results() -> anyhow::Result<()> {
         let model = ModelId::from("codex-mini-latest");
 
@@ -516,6 +580,37 @@ mod tests {
         forge_app::domain::ToolCallFull::new(name)
             .call_id(ToolCallId::new(call_id))
             .arguments(forge_app::domain::ToolCallArguments::from_json(args))
+    }
+
+    #[test]
+    fn test_codex_tool_parameters_removes_unsupported_uri_format() -> anyhow::Result<()> {
+        let fixture = schemars::Schema::try_from(json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "format": "uri"
+                }
+            }
+        }))
+        .unwrap();
+
+        let actual = codex_tool_parameters(&fixture)?;
+
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string"
+                }
+            },
+            "additionalProperties": false,
+            "required": ["url"]
+        });
+
+        assert_eq!(actual, expected);
+
+        Ok(())
     }
 
     #[test]
@@ -1228,5 +1323,118 @@ mod tests {
                 .to_string()
                 .contains("max_tokens must fit into u32")
         );
+    }
+
+    #[test]
+    fn test_codex_request_preserves_phase_on_assistant_message() -> anyhow::Result<()> {
+        use forge_app::domain::{MessagePhase, TextMessage};
+        use forge_domain::Role;
+
+        let mut assistant_msg = TextMessage::new(Role::Assistant, "Thinking about this...");
+        assistant_msg.phase = Some(MessagePhase::Commentary);
+
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("Hello", None))
+            .add_entry(forge_app::domain::MessageEntry::from(ContextMessage::Text(
+                assistant_msg,
+            )))
+            .add_message(ContextMessage::user("Continue", None));
+
+        let actual = oai::CreateResponse::from_domain(context)?;
+
+        let oai::InputParam::Items(items) = actual.input else {
+            anyhow::bail!("Expected items input");
+        };
+
+        // Find the assistant EasyMessage
+        let assistant_item = items
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    oai::InputItem::EasyMessage(msg) if msg.role == oai::Role::Assistant
+                )
+            })
+            .expect("Should have an assistant message");
+
+        let oai::InputItem::EasyMessage(msg) = assistant_item else {
+            anyhow::bail!("Expected EasyMessage");
+        };
+
+        assert_eq!(msg.phase, Some(oai::MessagePhase::Commentary));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codex_request_preserves_final_answer_phase() -> anyhow::Result<()> {
+        use forge_app::domain::{MessagePhase, TextMessage};
+        use forge_domain::Role;
+
+        let mut assistant_msg = TextMessage::new(Role::Assistant, "The answer is 42.");
+        assistant_msg.phase = Some(MessagePhase::FinalAnswer);
+
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("What is the answer?", None))
+            .add_entry(forge_app::domain::MessageEntry::from(ContextMessage::Text(
+                assistant_msg,
+            )))
+            .add_message(ContextMessage::user("Thanks", None));
+
+        let actual = oai::CreateResponse::from_domain(context)?;
+
+        let oai::InputParam::Items(items) = actual.input else {
+            anyhow::bail!("Expected items input");
+        };
+
+        let assistant_item = items
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    oai::InputItem::EasyMessage(msg) if msg.role == oai::Role::Assistant
+                )
+            })
+            .expect("Should have an assistant message");
+
+        let oai::InputItem::EasyMessage(msg) = assistant_item else {
+            anyhow::bail!("Expected EasyMessage");
+        };
+
+        assert_eq!(msg.phase, Some(oai::MessagePhase::FinalAnswer));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_codex_request_no_phase_when_none() -> anyhow::Result<()> {
+        let context = ChatContext::default()
+            .add_message(ContextMessage::user("Hello", None))
+            .add_message(ContextMessage::assistant("Response", None, None, None))
+            .add_message(ContextMessage::user("Continue", None));
+
+        let actual = oai::CreateResponse::from_domain(context)?;
+
+        let oai::InputParam::Items(items) = actual.input else {
+            anyhow::bail!("Expected items input");
+        };
+
+        let assistant_item = items
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    oai::InputItem::EasyMessage(msg) if msg.role == oai::Role::Assistant
+                )
+            })
+            .expect("Should have an assistant message");
+
+        let oai::InputItem::EasyMessage(msg) = assistant_item else {
+            anyhow::bail!("Expected EasyMessage");
+        };
+
+        assert_eq!(msg.phase, None);
+
+        Ok(())
     }
 }
